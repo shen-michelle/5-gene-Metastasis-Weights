@@ -1,0 +1,353 @@
+---
+title:   "Shen / Liss Model Fitting Report"
+date:    "`r paste0('Date: ', format(Sys.time(), '%Y-%m-%d %X %Z'))`"
+author: "Prepared by James Robert White, PhD (Resphera Biosciences)" 
+output:
+  html_document:
+    theme: default
+    highlight: default
+    toc: true
+    toc_depth: 3
+    collapse: subsubsection
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+<style type="text/css">
+.list-group-item.active {
+  color: white;
+  background-color: #3a86ff;
+  border: none;
+}
+.list-group-item:hover,
+.list-group-item.active:hover {
+    color: white;
+    background-color: #3a86ff;
+}
+.title{
+  color: #3a86ff;
+}
+</style>
+
+
+```{r dirs, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+# --- 
+# to run:
+# setwd("~/Desktop/shen-model-fitting")
+# library(rmarkdown)
+# render("A01.1-shen-report.Rmd")
+
+# ---
+# otherwise, for troubleshooting continue step by step
+# set the working directory as the location of the script
+setwd("~/Desktop/shen-model-fitting")
+# ---
+
+knitr::opts_chunk$set(echo=FALSE)
+library(RColorBrewer)
+library(ggplot2)
+library(scales)
+require(gtools)
+library(MASS)
+library(reshape2)
+library(ggrepel)
+library(tidyverse)
+library(table1)
+library(ggpubr)
+library(readxl)
+library(DT)
+library(pROC)
+library(DescTools)
+library(caret)
+library(glmnet)
+
+
+set.seed(123)
+
+# ---
+# load data
+cncrDf = read.csv("Logistic Regression Cancer Cell.csv", check.names=FALSE)
+tcgaDf = read.csv("Logistic Regression TCGA.csv", check.names=FALSE)
+
+# ---
+# Our primary goal in this analysis is to assist with the
+# response to the following reviewer comment:
+# "The authors simply averaged the Z-scores of each gene equally
+# without any adjusted weighting or attempts to use more 
+# sophisticated regression or elastic net methods. The authors 
+# may want to test if these approaches improve the performance 
+# of their signature on the TCGA and Taylor datasets" 
+# ---
+
+# ---
+# merge data
+cncrDf  = cncrDf[,c(1:9)]
+colnames(cncrDf) = c("id", colnames(cncrDf)[2:8], "Gleason Score")
+cncrDf$cohort = "Cancer Cell"
+
+tcgaDf  = tcgaDf[,c(1:7,9:10)]
+tcgaDf$cohort = "TCGA"
+tcgaDf  = tcgaDf[,c(1:6,8:9,7,10)]
+colnames(tcgaDf) = colnames(cncrDf) 
+
+jointDf = rbind(cncrDf,tcgaDf)
+jointDf = jointDf[,c(1,10,2:9)]
+
+myDT1 <- datatable(jointDf, 
+                  class      = 'cell-border stripe', 
+                  rownames   = F, 
+                  filter     = 'top',
+                  extensions = "Buttons", 
+                  options    = list(paging = TRUE,
+                                    scrollX=TRUE, 
+                                    searching = TRUE,
+                                    ordering = TRUE,
+                                    dom = 'Bfrtip',
+                                    buttons = c('copy', 'csv', 'excel'),
+                                    pageLength =20))
+
+for (j in 3:7){
+  jointDf[,j] = as.numeric(jointDf[,j])
+}
+
+for (j in 3:7){
+  jointDf = jointDf[!is.na(jointDf[,j]),]
+}
+
+jointDf$cohort = factor(jointDf$cohort)
+jointDf        = jointDf[grepl("^[01]", jointDf$`Disease Free Status`),]
+jointDf$`Disease Free Status` = ifelse(grepl("^0", jointDf$`Disease Free Status`), "disease free", "recurred")
+jointDf$`Disease Free Status` = factor(jointDf$`Disease Free Status`)
+
+myDT2 <- datatable(aggregate(id~`Disease Free Status`+cohort, jointDf, FUN=length))
+
+meltedjointDf = melt(jointDf, id.vars=colnames(jointDf)[c(1,2,8,9,10)])
+colnames(meltedjointDf)[6] = "gene"
+colnames(meltedjointDf)[7] = "Value"
+
+myCol1 = c("#3a86ff","#ffbe0b")
+
+plotDist <- ggplot(data=meltedjointDf, aes_string(x=paste0("`", "Disease Free Status","`"), y=paste0("`", "Value","`"))) +
+  geom_boxplot(aes(color=`Disease Free Status`), fill=NA, outlier.size=0, coef=1e100, alpha=0.9) +
+  geom_point(aes(color=`Disease Free Status`), pch=19, size=1.5, alpha=0.35)  +
+  scale_fill_manual(values=myCol1) + 
+  scale_color_manual(values=myCol1) + 
+  theme_bw() + 
+  theme(aspect.ratio = 0.75, 
+        legend.position = "right", 
+        legend.text  = element_text(size=8), 
+        legend.title = element_text(size=8),
+        axis.text.x  = element_text(size=10, colour="black"),
+        axis.text.y  = element_text(size=10, colour="black"),
+        axis.title.x = element_text(size=11, colour="black"),
+        axis.title.y = element_text(size=11, colour="black"),
+        plot.title   = element_text(size=10, colour="black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) + 
+  scale_y_continuous(breaks=pretty_breaks(n=5), expand=expansion(mult = c(0.05, 0.15))) +
+  stat_compare_means(comparisons =list(c("disease free","recurred")), method = 'wilcox.test', size=3.5) +
+  facet_grid(gene ~ cohort) 
+
+
+
+# Model Building : Elastic Net Regression 
+control <- trainControl(method = "none", 
+                        allowParallel   = TRUE,
+                        classProbs = TRUE, 
+                        savePredictions = "final",
+                        verboseIter = TRUE) 
+  
+jointDfMod           = jointDf
+colnames(jointDfMod) = gsub(" ", ".", colnames(jointDfMod))  
+jointDfMod$Disease.Free.Status = factor(gsub(" ", ".", as.character(jointDfMod$Disease.Free.Status)))
+
+# Training ELastic Net Regression model 
+elastic_model_a <- caret::train(Disease.Free.Status ~ cohort + U2AF2 + RUVBL1 + HDGF + FABP4 + STMN1, 
+                                data       = jointDfMod,
+                                method     = "glmnet",
+                                metric     = "ROC",
+                                family     = "binomial",
+                                trControl  = control,
+                                trace      = FALSE)
+elastic_model_a
+
+rocinput_a = data.frame(recurred = predict(elastic_model_a, type="prob")[,2], 
+                        obs = elastic_model_a$trainingData$.outcome) 
+roc_a <- roc(obs ~ recurred, data = rocinput_a)
+
+# tcga
+elastic_model_t <- caret::train(Disease.Free.Status ~ U2AF2 + RUVBL1 + HDGF + FABP4 + STMN1, 
+                                data       = jointDfMod[jointDfMod$cohort == "TCGA",],
+                                method     = "glmnet",
+                                metric     = "ROC",
+                                family     = "binomial",
+                                trControl  = control,
+                                trace      = FALSE)
+elastic_model_t
+
+rocinput_t = data.frame(recurred = predict(elastic_model_t, type="prob")[,2], 
+                        obs = elastic_model_t$trainingData$.outcome) 
+roc_t <- roc(obs ~ recurred, data = rocinput_t)
+
+# cancer cell
+elastic_model_c <- caret::train(Disease.Free.Status ~ U2AF2 + RUVBL1 + HDGF + FABP4 + STMN1, 
+                                data       = jointDfMod[jointDfMod$cohort == "Cancer Cell",],
+                                method     = "glmnet",
+                                metric     = "ROC",
+                                family     = "binomial",
+                                trControl  = control,
+                                trace      = FALSE)
+elastic_model_c
+
+rocinput_c = data.frame(recurred = predict(elastic_model_c, type="prob")[,2], 
+                        obs = elastic_model_c$trainingData$.outcome) 
+roc_c <- roc(obs ~ recurred, data = rocinput_c)
+
+roc.list = list("Both Cohorts" = roc_a,
+                "TCGA" = roc_t,
+                "Cancer Cell" = roc_c)
+
+ci.list <- lapply(roc.list, ci.se, specificities = seq(0, 1, l = 25))
+
+dat.ci.list <- lapply(ci.list, function(ciobj) 
+  data.frame(x = as.numeric(rownames(ciobj)),
+             lower = ciobj[, 1],
+             upper = ciobj[, 3]))
+
+rocPlot1 <- ggroc(roc.list) + 
+              theme_minimal() + 
+              geom_abline(slope=1, 
+              intercept = 1, 
+              linetype = "dashed", 
+              alpha=0.7,
+              color = "grey") + 
+              coord_equal() + 
+              xlab("Specificity") + 
+              ylab("Sensitivity") +
+              theme(plot.title = element_text(size=11))
+
+aucRes = rbind(c("Both Cohorts", roc_a$auc[1]),
+c("TCGA only", roc_t$auc[1]),
+c("Cancer Cell only", roc_c$auc[1]))
+
+aucRes = data.frame(aucRes)
+aucRes[,2] = 100*round(as.numeric(aucRes[,2]),4)
+colnames(aucRes) = c("Data Used for GLMNet", "AUC Estimate")
+
+aucResStr = paste0(aucRes[1,1], " AUC=", aucRes[1,2], "\n",
+aucRes[2,1], " AUC=", aucRes[2,2], "\n",
+aucRes[3,1], " AUC=", aucRes[3,2])
+
+rocPlot1 <- rocPlot1 + ggtitle(aucResStr)
+
+```
+
+# Introduction
+
+Our primary goal in this analysis is to assist with the
+response to the following reviewer comment:
+
+```
+The authors simply averaged the Z-scores of each gene equally
+without any adjusted weighting or attempts to use more 
+sophisticated regression or elastic net methods. The authors 
+may want to test if these approaches improve the performance 
+of their signature on the TCGA and Taylor datasets
+```
+
+In this report, we explore different modeling strategies
+to incorporate the five variables of interest to predict 
+disease free vs recurrence status.
+
+# Datasets for Analysis
+## Cancer Cell
+The source file for the Cancer Cell cohort was `Logistic Regression Cancer Cell.csv`
+
+## TCGA
+The source file for the Cancer Cell cohort was `Logistic Regression TCGA.csv`
+
+# Summary of Results
+Below is a dynamic table displaying all joined sample results across
+the two cohorts. Note that some values are missing and these
+rows were not utilized in the model fitting analysis. 
+
+This table can be filtered, sorted,
+or exported to `csv` or `xlsx` format. 
+
+```{r echo=FALSE, warning=FALSE}
+myDT1 
+```
+
+After removal of missing data, we have the following 
+counts per disease status category and cohort for model fitting:
+
+```{r echo=FALSE, warning=FALSE}
+myDT2
+```
+
+# Analysis Results
+Here we summarize the overall results emphasizing classification of recurrence
+status as a binary variable.
+
+## Distributions
+Looking at each gene and differences associated with recurrence, 
+we find significant differences in both cohorts (Mann-Whitney test
+shown below):
+
+```{r echo=FALSE, fig.width=7.5,fig.height=9.5} 
+  plotDist
+```
+
+## Elastic Net Regression
+Using the `glmnet` package in R, we performed
+of elastic net model fitting using all data (no cross validation).
+This was done merging both cohorts together, and for TCGA and
+Cancer Cell cohorts individually. Below we display the ROC/AUC
+results of those model fits. 
+
+```{r echo=FALSE, fig.width=7.5,fig.height=6.5} 
+  rocPlot1
+```
+
+## Variable Importance
+Below we show the variable importance results
+for each of the three elastic net model fitting approaches.
+
+### Both cohorts
+```{r echo=FALSE}
+  varImp(elastic_model_a)
+```
+
+### TCGA only
+```{r echo=FALSE}
+  varImp(elastic_model_t)
+```
+
+### Cancer Cell only
+```{r echo=FALSE}
+  varImp(elastic_model_c)
+```
+
+## Final Model Coefficients
+Below we display the coefficients in the final
+model for each input dataset
+
+### Both cohorts
+```{r echo=FALSE}
+  coef(elastic_model_a$finalModel, elastic_model_a$bestTune$lambda)
+
+```
+
+### TCGA only
+```{r echo=FALSE}
+  coef(elastic_model_t$finalModel, elastic_model_t$bestTune$lambda)
+
+```
+
+### Cancer Cell only
+```{r echo=FALSE}
+  coef(elastic_model_c$finalModel, elastic_model_c$bestTune$lambda)
+```
+
+# End of Document
